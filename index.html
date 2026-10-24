@@ -1632,6 +1632,129 @@ break;case"<bookViews":;case"<bookViews>":;case"</bookViews>":break;case"<workbo
   TO.D = { isBilled: isBilled, parseMaster: parseMaster, parseTracker: parseTracker, linkAll: linkAll, topicOf: topicOf, TOPIC_NAMES: TOPIC_NAMES, toIso: toIso, words: words, agreementOf: agreementOf };
 })(typeof window !== 'undefined' ? (window.TO = window.TO || {}) : (globalThis.TO = globalThis.TO || {}));
 </script>
+<script>/* Google Drive reader for phones and browsers without folder access.
+   Uses Google sign-in (Client ID below) and the read-only Drive API.
+   Only the signed-in owner's email is allowed. */
+(function () {
+  var CLIENT_ID = '106397705718-jgnvl9ovo8q2h7crei0obmvqte621dat.apps.googleusercontent.com';
+  var OWNER_EMAIL = 'eradharam@gmail.com';
+  var SCOPE = 'https://www.googleapis.com/auth/drive.readonly openid email';
+  var TOKEN = null, TOKEN_EXP = 0, client = null, EMAIL = '';
+  var KEY = 'tenderOffice.gtoken';
+
+  function loadGsi() {
+    return new Promise(function (resolve, reject) {
+      if (window.google && google.accounts && google.accounts.oauth2) return resolve();
+      var s = document.createElement('script');
+      s.src = 'https://accounts.google.com/gsi/client';
+      s.onload = function () { resolve(); };
+      s.onerror = function () { reject(new Error('Could not load Google sign-in. Check the internet connection.')); };
+      document.head.appendChild(s);
+    });
+  }
+
+  function saveSession() {
+    try { localStorage.setItem(KEY, JSON.stringify({ t: TOKEN, e: TOKEN_EXP, m: EMAIL })); } catch (e) { }
+  }
+  function restoreSession() {
+    try {
+      var s = JSON.parse(localStorage.getItem(KEY) || 'null');
+      if (s && s.t && s.e > Date.now() + 60000) { TOKEN = s.t; TOKEN_EXP = s.e; EMAIL = s.m || ''; return true; }
+    } catch (e) { }
+    return false;
+  }
+
+  async function init() {
+    await loadGsi();
+    client = google.accounts.oauth2.initTokenClient({
+      client_id: CLIENT_ID,
+      scope: SCOPE,
+      callback: function () { }
+    });
+  }
+
+  // Asks Google for a token. Shows the Google account chooser the first time.
+  function signIn(interactive) {
+    return new Promise(function (resolve, reject) {
+      if (!client) return reject(new Error('Sign-in not ready yet. Try again in a moment.'));
+      client.callback = function (resp) {
+        if (resp.error) return reject(new Error(resp.error_description || resp.error));
+        TOKEN = resp.access_token; TOKEN_EXP = Date.now() + (resp.expires_in || 3600) * 1000;
+        checkEmail().then(function () { saveSession(); resolve(EMAIL); }, reject);
+      };
+      client.requestAccessToken({ prompt: interactive ? 'select_account' : '' });
+    });
+  }
+
+  async function checkEmail() {
+    var r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', { headers: { Authorization: 'Bearer ' + TOKEN } });
+    var j = await r.json();
+    EMAIL = (j.email || '').toLowerCase();
+    if (EMAIL !== OWNER_EMAIL) {
+      signOut();
+      throw new Error('This Google account is not allowed. Sign in with ' + OWNER_EMAIL + '.');
+    }
+  }
+
+  function signOut() {
+    if (TOKEN && window.google && google.accounts && google.accounts.oauth2) {
+      try { google.accounts.oauth2.revoke(TOKEN, function () { }); } catch (e) { }
+    }
+    TOKEN = null; TOKEN_EXP = 0; EMAIL = '';
+    try { localStorage.removeItem(KEY); } catch (e) { }
+  }
+
+  function signedIn() { return !!TOKEN && TOKEN_EXP > Date.now() && EMAIL === OWNER_EMAIL; }
+
+  async function api(url) {
+    var r = await fetch(url, { headers: { Authorization: 'Bearer ' + TOKEN } });
+    if (r.status === 401) { TOKEN = null; throw new Error('Sign-in expired. Press Sign in again.'); }
+    if (!r.ok) throw new Error('Drive returned ' + r.status);
+    return r;
+  }
+
+  var XLSX_MIME = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+  var SHEET_MIME = 'application/vnd.google-apps.spreadsheet';
+
+  // Finds the newest file whose name matches the pattern (spaces and underscores are treated alike).
+  // Accepts an .xlsx file or a Google Sheet with the same name.
+  async function findNewest(words, keyword) {
+    var q = "name contains '" + keyword.replace(/'/g, "\\'") + "' and trashed = false";
+    var r = await api('https://www.googleapis.com/drive/v3/files?q=' + encodeURIComponent(q) +
+      '&fields=files(id,name,mimeType,modifiedTime)&orderBy=modifiedTime%20desc&pageSize=50');
+    var j = await r.json();
+    var re = new RegExp('^' + words + '\\s*(\\.xlsx)?$', 'i');
+    var hits = (j.files || []).filter(function (f) {
+      var base = f.name.replace(/\s+$/, '');
+      return re.test(base) && (f.mimeType === SHEET_MIME || /\.xlsx$/i.test(base) || f.mimeType === XLSX_MIME);
+    });
+    return hits[0] || null;
+  }
+
+  async function downloadBytes(f) {
+    var url = f.mimeType === SHEET_MIME
+      ? 'https://www.googleapis.com/drive/v3/files/' + f.id + '/export?mimeType=' + encodeURIComponent(XLSX_MIME)
+      : 'https://www.googleapis.com/drive/v3/files/' + f.id + '?alt=media';
+    var r = await api(url);
+    return new Uint8Array(await r.arrayBuffer());
+  }
+
+  // Reads the two registers the app needs. Returns { reg, trk, regInfo, trkInfo }.
+  async function readRegisters(X) {
+    var out = { reg: null, trk: null, regInfo: null, trkInfo: null };
+    var mr = await findNewest('master\\s+register', 'MASTER REGISTER');
+    if (mr) { out.reg = TO.D.parseMaster(X, await downloadBytes(mr)); out.regInfo = { path: mr.name, mtime: Date.parse(mr.modifiedTime) }; }
+    var tk = await findNewest('mc[ _]billing[ _]tracker', 'billing');
+    if (tk) { out.trk = TO.D.parseTracker(X, await downloadBytes(tk)); out.trkInfo = { path: tk.name, mtime: Date.parse(tk.modifiedTime) }; }
+    return out;
+  }
+
+  window.TOG = {
+    init: init, signIn: signIn, signOut: signOut, signedIn: signedIn,
+    restoreSession: restoreSession, readRegisters: readRegisters, email: function () { return EMAIL; }
+  };
+})();
+</script>
 <script>/* Tender Office – application screens */
 (function () {
   'use strict';
@@ -1839,6 +1962,24 @@ break;case"<bookViews":;case"<bookViews>":;case"</bookViews>":break;case"<workbo
     S.docs.concat((CACHE.reg && CACHE.reg.cdocs) || []).forEach(function (d) { push((firm(d.firm).short || '') + ' · ' + d.name, 'Document validity', d.validTill, null); });
     return out.sort(function (a, b) { return a.days - b.days; });
   }
+  function signBanner() {
+    if (!window.TOG || (DIR && DIRSTATE === 'granted')) return '';
+    if (!window.__togInit) {
+      window.__togInit = true; TOG.restoreSession();
+      TOG.init().then(function () { if (view === 'home') go('home'); if (TOG.signedIn()) syncDrive(true); }, function () { });
+    }
+    if (TOG.signedIn()) {
+      return '<section class="card" style="margin-bottom:12px"><b>Connected to Google Drive.</b> <button class="btn primary" id="gbanner">Update from Google Drive</button></section>';
+    }
+    return '<section class="card" style="margin-bottom:12px;border-color:#F1D9A6;background:#FFF8E6"><b>Sign in to read your Google Drive on this device.</b><p class="muted">Your works, bills and registers load from your Drive after you sign in.</p><button class="btn primary" id="gbanner">Sign in to Google Drive</button></section>';
+  }
+  function bindSignBanner() {
+    var gb = document.getElementById('gbanner'); if (!gb) return;
+    gb.onclick = function () {
+      if (TOG.signedIn()) return syncDrive(false);
+      TOG.signIn(true).then(function () { go('home'); syncDrive(false); }, function (e) { toast(e.message || String(e), 'err'); });
+    };
+  }
   function vHome() {
     var fy = M.fyOf(M.todayIso()), ym = M.todayIso().slice(0, 7);
     var live = L.invoices.filter(function (i) { return !i.dup && !i.firmToFirm; });
@@ -1855,6 +1996,7 @@ break;case"<bookViews":;case"<bookViews>":;case"</bookViews>":break;case"<workbo
     $('#view').innerHTML =
       '<div class="hello"><div><h2>' + (d.getHours() < 12 ? 'Good morning' : d.getHours() < 17 ? 'Good afternoon' : 'Good evening') + ', ' + h((S.settings.author || '').split(' ')[0]) + '</h2><p>' + d.toLocaleDateString('en-IN', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' }) + ' · FY ' + fy + '</p></div>' +
       '<div class="qa"><button class="btn primary" data-q="letter">' + icon('mail') + 'New letter</button><button class="btn" data-q="invoice">' + icon('receipt') + 'New invoice</button><button class="btn" data-q="works">' + icon('book') + 'Works</button></div></div>' +
+      signBanner() +
       (L.works.length || S.contracts.length ? '' : noData()) +
       '<div class="stats">' +
       stat('Running works', running, L.works.length + ' works in register', 'works') +
@@ -1871,6 +2013,7 @@ break;case"<bookViews":;case"<bookViews>":;case"</bookViews>":break;case"<workbo
         return '<tr class="click" data-r="' + i + '"><td><span class="tag ' + (r.kind === 'Letter' ? 't1' : 't2') + '">' + r.kind + '</span></td><td><b>' + h(r.no) + '</b><div class="muted ell">' + h(r.text || '') + '</div></td><td class="nw r">' + M.fmtDate(r.date) + '</td></tr>';
       }).join('') + '</tbody></table>' : '<div class="empty">Letters and invoices you prepare will appear here.</div>') + '</section></div>';
     function stat(l, v, s, k) { return '<button class="stat" data-st="' + k + '"><span>' + h(l) + '</span><b>' + h(String(v)) + '</b><small>' + h(s) + '</small></button>'; }
+    bindSignBanner();
     $$('[data-q]').forEach(function (b) {
       b.onclick = function () { var q = b.dataset.q; if (q === 'reg') go('lookup', { tab: 'bills' }); else if (q === 'lk-bgsd') go('lookup', { tab: 'bgsd' }); else go(q); };
     });
@@ -2397,7 +2540,9 @@ break;case"<bookViews":;case"<bookViews>":;case"</bookViews>":break;case"<workbo
   }
   function setSync(msg) { SYNCMSG = msg; var el = $('#syncst'); if (el) el.textContent = msg; }
   async function syncDrive(quiet) {
-    if (!DIR || DIRSTATE !== 'granted' || SYNCING) return;
+    if (SYNCING) return;
+    if ((!DIR || DIRSTATE !== 'granted') && window.TOG && TOG.signedIn()) return syncFromGoogle(quiet);
+    if (!DIR || DIRSTATE !== 'granted') return;
     SYNCING = true; renderSyncChip(); setSync('Reading Drive folder…');
     try {
       var idx = await scanDir(DIR, function (n) { setSync('Reading Drive folder… ' + n + ' items'); });
@@ -2414,12 +2559,40 @@ break;case"<bookViews":;case"<bookViews>":;case"</bookViews>":break;case"<workbo
     } catch (e) { console.warn(e); setSync(''); toast('Could not read the Drive folder: ' + (e && e.message || e), 'err'); }
     SYNCING = false; renderSyncChip();
   }
+  async function syncFromGoogle(quiet) {
+    SYNCING = true; renderSyncChip(); setSync('Reading Google Drive…');
+    try {
+      var r = await TOG.readRegisters(window.XLSX);
+      if (!r.reg) throw new Error('MASTER REGISTER.xlsx was not found in your Google Drive.');
+      CACHE = Object.assign({}, CACHE, { reg: r.reg, trk: r.trk, regInfo: r.regInfo, trkInfo: r.trkInfo, idx: CACHE.idx || { dirs: [], files: [] }, at: new Date().toISOString() });
+      try { await idbSet('cache', { reg: CACHE.reg, trk: CACHE.trk, idx: CACHE.idx, regInfo: CACHE.regInfo, trkInfo: CACHE.trkInfo, at: CACHE.at }); } catch (e) { }
+      relink(); setSync('');
+      if (!quiet) toast('Updated from Google Drive: ' + L.works.length + ' works, ' + L.invoices.length + ' bills.');
+      if (view !== 'letter' && view !== 'invoice') go(view, arg);
+    } catch (e) { console.warn(e); setSync(''); toast('Could not read Google Drive: ' + (e && e.message || e), 'err'); }
+    SYNCING = false; renderSyncChip();
+  }
   async function loadCache() {
     try { var c = await idbGet('cache'); if (c) { CACHE = c; relink(); } } catch (e) { }
   }
   function renderSyncChip() {
     var el = document.getElementById('syncchip'); if (!el) return;
-    if (!DIR || DIRSTATE !== 'granted') { el.innerHTML = ''; return; }
+    if (!DIR || DIRSTATE !== 'granted') {
+      if (!window.TOG) { el.innerHTML = ''; return; }
+      if (!window.__togInit) {
+        window.__togInit = true; TOG.restoreSession();
+        TOG.init().then(function () { renderSyncChip(); if (TOG.signedIn()) syncDrive(true); }, function () { });
+      }
+      var gs = TOG.signedIn();
+      el.innerHTML = gs
+        ? '<button class="dchip plain" id="syncbtn" title="Read the latest registers from Google Drive">' + (SYNCING ? '<span id="syncst">' + h(SYNCMSG || 'Updating…') + '</span>' : '↻ Update from Google Drive') + '</button>'
+        : '<button class="dchip off" id="gsignin">Sign in to Google Drive</button>';
+      var gb = document.getElementById('gsignin');
+      if (gb) gb.onclick = function () { TOG.signIn(true).then(function () { renderSyncChip(); syncDrive(false); }, function (e) { toast(e.message || String(e), 'err'); }); };
+      var sb0 = document.getElementById('syncbtn');
+      if (sb0) sb0.onclick = function () { syncDrive(false); };
+      return;
+    }
     el.innerHTML = '<button class="dchip ' + (SYNCING ? 'warn' : 'plain') + '" id="syncbtn" title="Read the latest registers and files from Drive">' + (SYNCING ? '<span id="syncst">' + h(SYNCMSG || 'Updating…') + '</span>' : '↻ ' + (CACHE.at ? 'Updated ' + new Date(CACHE.at).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' }) : 'Update from Drive')) + '</button>';
     $('#syncbtn').onclick = function () { syncDrive(false); };
   }
